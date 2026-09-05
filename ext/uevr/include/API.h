@@ -520,6 +520,9 @@ typedef struct {
 
     UEVR_XrSpace (*get_stage_space)(); /* XrSpace */
     UEVR_XrSpace (*get_view_space)(); /* XrSpace */
+
+    /* Returns true when a currently tracked eye-gaze pose is available. */
+    bool (*get_eye_gaze_pose)(UEVR_Vector3f* out_position, UEVR_Quaternionf* out_rotation);
 } UEVR_OpenXRData;
 
 DECLARE_UEVR_HANDLE(UEVR_ActionHandle);

@@ -41,6 +41,8 @@ class HeadAim final : public PluginExtension {
     vec2 CurrentArmRotation{};
     quat SmoothedHmdQuat  = quat(1, 0, 0, 0);
     bool SmoothedQuatInit = false;
+    quat SmoothedGazeQuat  = quat(1, 0, 0, 0);
+    bool SmoothedGazeQuatInit = false;
 
     struct TwistBounds {
         // Yaw, Pitch
@@ -65,8 +67,8 @@ public:
         Instance                  = this;
         PluginExtension::Instance = this;
         Name                      = "HeadAim";
-        Version                   = "2.3.0";
-        VersionInt                = 230;
+        Version                   = "2.5.1";
+        VersionInt                = 251;
         VersionCheckFnName        = L"OnFetchHeadAimPluginData";
         VersionPropertyName       = L"HeadAimVersion";
     }
@@ -228,7 +230,49 @@ private:
         const float t        = 1.0f - expf(-lambda * Delta);
         SmoothedHmdQuat      = normalize(slerp(SmoothedHmdQuat, q, t));
 
-        const vec3 dir = normalize(SmoothedHmdQuat * fwd);
+        const vec3 headDir = normalize(SmoothedHmdQuat * fwd);
+
+        const float headYawRad   = atan2(headDir.y, headDir.x);
+        const float headPitchRad = atan2(headDir.z, sqrt(headDir.x * headDir.x + headDir.y * headDir.y));
+        const float headYawDeg   = -degrees(headYawRad);
+        const float headPitchDeg = -degrees(headPitchRad);
+
+        quat aimQuat = SmoothedHmdQuat;
+        UEVR_Vector3f gazePose{};
+        UEVR_Quaternionf gazeRotation{};
+        const auto apiVersion = API::get()->param()->version;
+        const auto openxr = API::get()->param()->openxr;
+        const bool hasEyeGazeApi = apiVersion != nullptr && apiVersion->major == 2 && apiVersion->minor >= 40;
+        const bool hasGaze = hasEyeGazeApi && API::VR::is_openxr() && openxr != nullptr && openxr->get_eye_gaze_pose != nullptr &&
+                             openxr->get_eye_gaze_pose(&gazePose, &gazeRotation);
+
+        if (hasGaze) {
+            const auto rotationOffset = API::VR::get_rotation_offset();
+            const quat qGaze(gazeRotation.w, gazeRotation.z, gazeRotation.x, gazeRotation.y);
+            const quat qRotationOffset(rotationOffset.w, rotationOffset.z, rotationOffset.x, rotationOffset.y);
+            const float gazeYawCalibrationDeg = clamp(API::VR::get_mod_value<float>("HeadAim_GazeYawOffset"), -20.0f, 20.0f);
+            const float gazePitchCalibrationDeg = clamp(API::VR::get_mod_value<float>("HeadAim_GazePitchOffset"), -20.0f, 20.0f);
+            const quat qGazeCalibration = MakeYawPitchRollQuat(
+                -radians(gazeYawCalibrationDeg), radians(gazePitchCalibrationDeg), 0.0f);
+            const quat gazeTarget = normalize(qRotationOffset * qGaze * qGazeCalibration * qHeadAimOffset);
+
+            if (!SmoothedGazeQuatInit) {
+                SmoothedGazeQuat = gazeTarget;
+                SmoothedGazeQuatInit = true;
+            }
+
+            const float gazeAngle = QuatAngleRad(SmoothedGazeQuat, gazeTarget);
+            const float gazeEffectiveAngle = max(0.0f, gazeAngle - deadbandRad);
+            const float gazeAdaptive = clamp(gazeEffectiveAngle / maxAngleRad, 0.0f, 1.0f);
+            const float gazeLambda = mix(lambdaSlow, lambdaFast, gazeAdaptive);
+            const float gazeT = 1.0f - expf(-gazeLambda * Delta);
+            SmoothedGazeQuat = normalize(slerp(SmoothedGazeQuat, gazeTarget, gazeT));
+            aimQuat = SmoothedGazeQuat;
+        } else {
+            SmoothedGazeQuatInit = false;
+        }
+
+        const vec3 dir = normalize(aimQuat * fwd);
 
         const float yawRad   = atan2(dir.y, dir.x);
         const float pitchRad = atan2(dir.z, sqrt(dir.x * dir.x + dir.y * dir.y));
@@ -245,7 +289,7 @@ private:
             armsTargetPitchDeg = clamp(armsTargetPitchDeg, TorsoStats->Arm.BoundsLow.y, TorsoStats->Arm.BoundsHigh.y);
 
         *ArmsTarget = vec2(armsTargetYawDeg, armsTargetPitchDeg);
-        *HeadTarget = vec2(yawDeg, pitchDeg);
+        *HeadTarget = vec2(headYawDeg, headPitchDeg);
     }
 
     void ProcessArmTwist(RotationDegrees cockpitRelativeRot, RotationDegrees torsoAimRotation) {
