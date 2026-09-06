@@ -1,5 +1,7 @@
 #include <PluginExtension.h>
 
+#include <atomic>
+
 #define GLM_ENABLE_EXPERIMENTAL
 #include <glm/gtx/euler_angles.hpp>
 
@@ -17,6 +19,7 @@ class HeadAim final : public PluginExtension {
     float*        ZoomLevel              = nullptr;
     float*        HeadAimPitchOffset     = nullptr;
     vec2*         TorsoRotation          = nullptr;
+    vec2*         NativeTorsoInput       = nullptr;
     vec3*         MechRelativeRotation   = nullptr;
     vec2*         HeadTarget             = nullptr;
     vec2*         ArmsTarget             = nullptr;
@@ -43,6 +46,14 @@ class HeadAim final : public PluginExtension {
     bool SmoothedQuatInit = false;
     quat SmoothedGazeQuat  = quat(1, 0, 0, 0);
     bool SmoothedGazeQuatInit = false;
+    std::atomic<float> TorsoYawInput{0.0f};
+    std::atomic<float> TorsoPitchInput{0.0f};
+    std::atomic<float> ViewYawCompensation{0.0f};
+    std::atomic<float> ViewPitchCompensation{0.0f};
+    std::atomic<float> LocomotionReferenceYaw{0.0f};
+    uint8_t LastLoggedMode = 0xff;
+    float NeutralTorsoPitch = 0.0f;
+    bool TorsoPitchNeutralInitialized = false;
 
     struct TwistBounds {
         // Yaw, Pitch
@@ -67,8 +78,8 @@ public:
         Instance                  = this;
         PluginExtension::Instance = this;
         Name                      = "HeadAim";
-        Version                   = "2.5.1";
-        VersionInt                = 251;
+        Version                   = "2.10.2";
+        VersionInt                = 2102;
         VersionCheckFnName        = L"OnFetchHeadAimPluginData";
         VersionPropertyName       = L"HeadAimVersion";
     }
@@ -80,6 +91,16 @@ public:
 
         this->Delta = delta;
 
+        // This installation always uses the custom control scheme. The mod's enum is not exposed
+        // consistently in its UI, so select its non-disabled arms-only state automatically.
+        if (InMech && HeadAimMode && *HeadAimMode == HeadAimMode::Disabled)
+            *HeadAimMode = HeadAimMode::ArmsOnly;
+
+        if (InMech && HeadAimMode && static_cast<uint8_t>(*HeadAimMode) != LastLoggedMode) {
+            LastLoggedMode = static_cast<uint8_t>(*HeadAimMode);
+            LogInfo("Head aim mode changed to %u", static_cast<unsigned>(*HeadAimMode));
+        }
+
         if (InMech && *HeadAimMode == HeadAimMode::ArmsOnly) {
             // LastRelativeViewRotator is used by the targeting logic, setting this here doesn't seem to affect anything else but targeting
             *LastViewRotator = vec3(HeadTarget->y + TorsoRotation->y, HeadTarget->x + TorsoRotation->x, 0.0f);
@@ -87,6 +108,64 @@ public:
             // Force disable arm lock, it's being handled manually
             *ArmlockEnabled = false;
             *EnableArmLock  = true;
+        }
+    }
+
+    virtual void on_xinput_get_state(uint32_t* retval, uint32_t userIndex, XINPUT_STATE* state) override {
+        if (!retval || *retval != ERROR_SUCCESS || !state || userIndex != 0 || !IsHeadAimEnabled())
+            return;
+
+        const SHORT physicalLeftX = state->Gamepad.sThumbLX;
+        const SHORT physicalLeftY = state->Gamepad.sThumbLY;
+        const SHORT physicalRightX = state->Gamepad.sThumbRX;
+
+        if (API::VR::get_mod_value<bool>("HeadAim_HeadRelativeLeftStick")) {
+            const auto thumbToFloat = [](const SHORT value) {
+                return clamp(static_cast<float>(value) / 32767.0f, -1.0f, 1.0f);
+            };
+            const auto floatToThumb = [](const float value) {
+                return static_cast<SHORT>(clamp(value, -1.0f, 1.0f) * 32767.0f);
+            };
+
+            const float x = thumbToFloat(physicalLeftX);
+            const float y = thumbToFloat(physicalLeftY);
+            const float yaw = radians(LocomotionReferenceYaw.load(std::memory_order_relaxed));
+            const float c = cos(yaw);
+            const float s = sin(yaw);
+            state->Gamepad.sThumbLY = floatToThumb(-s * x + c * y);
+        }
+
+        // The transformed lateral component is intentionally discarded. Legs are controlled only
+        // by physical right-stick X through MW5's existing left-stick leg-turn channel.
+        state->Gamepad.sThumbLX = physicalRightX;
+
+        const auto controllerToThumb = [](const float input) -> SHORT {
+            if (abs(input) < 0.0001f)
+                return 0;
+            constexpr float deadzone = static_cast<float>(XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE) / 32767.0f;
+            const float stick = sign(input) * (deadzone + (1.0f - deadzone) * abs(input));
+            return static_cast<SHORT>(clamp(stick, -1.0f, 1.0f) * 32767.0f);
+        };
+        state->Gamepad.sThumbRX = controllerToThumb(TorsoYawInput.load(std::memory_order_relaxed));
+        state->Gamepad.sThumbRY = controllerToThumb(TorsoPitchInput.load(std::memory_order_relaxed));
+    }
+
+    virtual void on_pre_calculate_stereo_view_offset(UEVR_StereoRenderingDeviceHandle, int, float,
+                                                      UEVR_Vector3f*, UEVR_Rotatorf* rotation, bool isDouble) override {
+        if (!rotation || !IsHeadAimEnabled())
+            return;
+
+        // This is deliberately render-only: gaze, targeting, and positional tracking continue to
+        // use the unmodified HMD pose. Both stereo eyes receive the same cockpit-relative rotation.
+        const float yawCompensation = ViewYawCompensation.load(std::memory_order_relaxed);
+        const float pitchCompensation = ViewPitchCompensation.load(std::memory_order_relaxed);
+        if (isDouble) {
+            auto* rotationDouble = reinterpret_cast<UEVR_Rotatord*>(rotation);
+            rotationDouble->yaw += static_cast<double>(yawCompensation);
+            rotationDouble->pitch += static_cast<double>(pitchCompensation);
+        } else {
+            rotation->yaw += yawCompensation;
+            rotation->pitch += pitchCompensation;
         }
     }
 
@@ -144,6 +223,16 @@ public:
 private:
     bool OnNewPawn(API::UObject* activePawn) {
         Pawn = activePawn;
+        TorsoYawInput.store(0.0f, std::memory_order_relaxed);
+        TorsoPitchInput.store(0.0f, std::memory_order_relaxed);
+        ViewYawCompensation.store(0.0f, std::memory_order_relaxed);
+        ViewPitchCompensation.store(0.0f, std::memory_order_relaxed);
+        LocomotionReferenceYaw.store(0.0f, std::memory_order_relaxed);
+        LastLoggedMode = 0xff;
+        NeutralTorsoPitch = 0.0f;
+        TorsoPitchNeutralInitialized = false;
+        SmoothedQuatInit = false;
+        SmoothedGazeQuatInit = false;
         if (!activePawn)
             return false;
 
@@ -151,7 +240,8 @@ private:
 
         const auto playerController = API::get()->get_player_controller(0);
 
-        bool success = TryGetProperty(Pawn, L"MechViewComponent", mechViewC) && TryGetProperty(Pawn, L"MechMeshComponent", mechMeshC);
+        bool success = TryGetProperty(Pawn, L"MechViewComponent", mechViewC) &&
+                       TryGetProperty(Pawn, L"MechMeshComponent", mechMeshC);
 
         if (!success) {
             LogInfo("Failed to get Mech references - probably not in a Mech");
@@ -171,6 +261,7 @@ private:
                   TryGetProperty(mechCockpit, L"VR_HUDManager", vrHUDManager) &&
                   TryGetPropertyStruct(vrHUDManager, L"ZoomLevel", ZoomLevel) &&
                   TryGetPropertyStruct(torsoTwistC, L"TorsoTwist", TorsoRotation) &&
+                  TryGetPropertyStruct(torsoTwistC, L"TorsoInput", NativeTorsoInput) &&
                   TryGetProperty(Pawn, L"RootComponent", mechRootC) &&
                   TryGetPropertyStruct(mechRootC, L"RelativeRotation", MechRelativeRotation) &&
                   TryGetPropertyStruct(mechCockpit, L"HeadAimPitchOffset", HeadAimPitchOffset) &&
@@ -216,7 +307,7 @@ private:
         vec3 pose;
         GetHMDPoseAndRotation(q, pose);
         const quat qHeadAimOffset = angleAxis(radians(*HeadAimPitchOffset), vec3(0, 1, 0));
-        q                         = normalize(q * qHeadAimOffset);
+        q = normalize(q);
 
         if (!SmoothedQuatInit) {
             SmoothedHmdQuat  = q;
@@ -237,7 +328,24 @@ private:
         const float headYawDeg   = -degrees(headYawRad);
         const float headPitchDeg = -degrees(headPitchRad);
 
-        quat aimQuat = SmoothedHmdQuat;
+        if (!TorsoPitchNeutralInitialized) {
+            // Calibrate torso pitch to the current comfortable pose. Weapon pitch calibration is
+            // deliberately excluded and remains an aiming-only adjustment.
+            NeutralTorsoPitch = TorsoRotation->y - headPitchDeg;
+            TorsoPitchNeutralInitialized = true;
+        }
+
+        const float viewPitchOffsetDeg = clamp(API::VR::get_mod_value<float>("HeadAim_TorsoPitchOffset"), -30.0f, 30.0f);
+        const float desiredTorsoYawDeg = MapHeadYawToTorso(headYawDeg);
+        const float desiredViewYawDeg = MapHeadYawToView(headYawDeg, desiredTorsoYawDeg);
+        LocomotionReferenceYaw.store(desiredViewYawDeg, std::memory_order_relaxed);
+        const float unclampedTorsoPitchDeg = NeutralTorsoPitch + headPitchDeg;
+        const float desiredTorsoPitchDeg = MapHeadPitchToTorso(unclampedTorsoPitchDeg);
+        UpdateTorsoController(desiredTorsoYawDeg, desiredTorsoPitchDeg,
+                              desiredViewYawDeg, unclampedTorsoPitchDeg + viewPitchOffsetDeg,
+                              headYawDeg, headPitchDeg);
+
+        quat aimQuat = normalize(SmoothedHmdQuat * qHeadAimOffset);
         UEVR_Vector3f gazePose{};
         UEVR_Quaternionf gazeRotation{};
         const auto apiVersion = API::get()->param()->version;
@@ -254,7 +362,9 @@ private:
             const float gazePitchCalibrationDeg = clamp(API::VR::get_mod_value<float>("HeadAim_GazePitchOffset"), -20.0f, 20.0f);
             const quat qGazeCalibration = MakeYawPitchRollQuat(
                 -radians(gazeYawCalibrationDeg), radians(gazePitchCalibrationDeg), 0.0f);
-            const quat gazeTarget = normalize(qRotationOffset * qGaze * qGazeCalibration * qHeadAimOffset);
+            // The mod's HeadAimPitchOffset calibrates head fallback only. Eye tracking has its own
+            // explicit yaw/pitch calibration and must not inherit the legacy head-aim offset.
+            const quat gazeTarget = normalize(qRotationOffset * qGaze * qGazeCalibration);
 
             if (!SmoothedGazeQuatInit) {
                 SmoothedGazeQuat = gazeTarget;
@@ -280,8 +390,12 @@ private:
         const float yawDeg   = -degrees(yawRad);
         const float pitchDeg = -degrees(pitchRad);
 
-        float armsTargetYawDeg   = *HeadAimLocked ? 0 : yawDeg;
-        float armsTargetPitchDeg = *HeadAimLocked ? 0 : pitchDeg;
+        // Convert the tracking-space gaze to the cockpit-relative angle expected by both weapon
+        // targets. The view compensation term also accounts for expanded outer-range head yaw.
+        const float aimTargetYawDeg = yawDeg + ViewYawCompensation.load(std::memory_order_relaxed);
+        const float aimTargetPitchDeg = pitchDeg + ViewPitchCompensation.load(std::memory_order_relaxed);
+        float armsTargetYawDeg   = *HeadAimLocked ? 0 : aimTargetYawDeg;
+        float armsTargetPitchDeg = *HeadAimLocked ? 0 : aimTargetPitchDeg;
 
         if (!TorsoStats->Arm.IsYawUnbound)
             armsTargetYawDeg = clamp(armsTargetYawDeg, TorsoStats->Arm.BoundsLow.x, TorsoStats->Arm.BoundsHigh.x);
@@ -289,7 +403,117 @@ private:
             armsTargetPitchDeg = clamp(armsTargetPitchDeg, TorsoStats->Arm.BoundsLow.y, TorsoStats->Arm.BoundsHigh.y);
 
         *ArmsTarget = vec2(armsTargetYawDeg, armsTargetPitchDeg);
-        *HeadTarget = vec2(headYawDeg, headPitchDeg);
+
+        // HeadTarget is the target for torso-mounted weapons, not the torso's physical rotation.
+        // Keep both weapon groups eye-driven (or head-driven when gaze is unavailable).
+        *HeadTarget = vec2(aimTargetYawDeg, aimTargetPitchDeg);
+    }
+
+    static float SmoothMappedMagnitude(const float magnitude, const float limit, const float innerBoundary,
+                                       const float comfortableRange, const float transitionWidth) {
+        if (limit <= innerBoundary)
+            return min(magnitude, limit);
+
+        const float clampedMagnitude = min(magnitude, comfortableRange);
+        const float outerSlope = (limit - innerBoundary) / (comfortableRange - innerBoundary);
+        const float transitionStart = innerBoundary - transitionWidth;
+        const float transitionEnd = innerBoundary + transitionWidth;
+
+        if (clampedMagnitude <= transitionStart)
+            return clampedMagnitude;
+        if (clampedMagnitude >= transitionEnd)
+            return min(innerBoundary + (clampedMagnitude - innerBoundary) * outerSlope, limit);
+
+        // Cubic Hermite interpolation joins the 1:1 and expanded sections with continuous slope.
+        const float span = transitionEnd - transitionStart;
+        const float t = (clampedMagnitude - transitionStart) / span;
+        const float t2 = t * t;
+        const float t3 = t2 * t;
+        const float h00 = 2.0f * t3 - 3.0f * t2 + 1.0f;
+        const float h10 = t3 - 2.0f * t2 + t;
+        const float h01 = -2.0f * t3 + 3.0f * t2;
+        const float h11 = t3 - t2;
+        const float startValue = transitionStart;
+        const float endValue = innerBoundary + transitionWidth * outerSlope;
+        return min(h00 * startValue + h10 * span + h01 * endValue + h11 * span * outerSlope, limit);
+    }
+
+    float MapHeadYawToTorso(const float headYawDeg) const {
+        constexpr float boundary = 40.0f;
+        constexpr float range = 90.0f;
+        constexpr float width = 3.0f;
+
+        const float direction = headYawDeg < 0.0f ? -1.0f : 1.0f;
+        constexpr float boundedYawReserve = 3.0f;
+        const float mechanicalLimit = TorsoStats->Torso.IsYawUnbound
+            ? 180.0f
+            : (direction < 0.0f ? abs(TorsoStats->Torso.BoundsLow.x) : abs(TorsoStats->Torso.BoundsHigh.x));
+        // MW5 turns the legs when torso input is held against a mechanical stop. Staying just
+        // inside the stop prevents that native assist from changing the player's leg heading.
+        const float limit = TorsoStats->Torso.IsYawUnbound
+            ? mechanicalLimit
+            : max(0.0f, mechanicalLimit - boundedYawReserve);
+        return direction * SmoothMappedMagnitude(abs(headYawDeg), limit, boundary, range, width);
+    }
+
+    float MapHeadYawToView(const float headYawDeg, const float desiredTorsoYawDeg) const {
+        constexpr float boundary = 40.0f;
+        constexpr float comfortableRange = 90.0f;
+        constexpr float boundedYawReserve = 3.0f;
+        const float direction = headYawDeg < 0.0f ? -1.0f : 1.0f;
+        const float mechanicalLimit = TorsoStats->Torso.IsYawUnbound
+            ? 180.0f
+            : (direction < 0.0f ? abs(TorsoStats->Torso.BoundsLow.x) : abs(TorsoStats->Torso.BoundsHigh.x));
+        const float torsoLimit = TorsoStats->Torso.IsYawUnbound
+            ? mechanicalLimit
+            : max(0.0f, mechanicalLimit - boundedYawReserve);
+        const float controlledHeadRange = torsoLimit <= boundary ? torsoLimit : comfortableRange;
+        const float overflow = max(0.0f, abs(headYawDeg) - controlledHeadRange);
+        return desiredTorsoYawDeg + direction * overflow;
+    }
+
+    float MapHeadPitchToTorso(const float desiredPitch) const {
+        if (TorsoStats->Torso.IsPitchUnbound)
+            return clamp(desiredPitch, -90.0f, 90.0f);
+        return clamp(desiredPitch, TorsoStats->Torso.BoundsLow.y, TorsoStats->Torso.BoundsHigh.y);
+    }
+
+    void UpdateTorsoController(const float desiredYawDeg, const float desiredPitchDeg,
+                               const float desiredViewYawDeg, const float desiredViewPitchDeg,
+                               const float rawHeadYawDeg, const float rawHeadPitchDeg) {
+        if (!IsHeadAimEnabled()) {
+            TorsoYawInput.store(0.0f, std::memory_order_relaxed);
+            TorsoPitchInput.store(0.0f, std::memory_order_relaxed);
+            ViewYawCompensation.store(0.0f, std::memory_order_relaxed);
+            ViewPitchCompensation.store(0.0f, std::memory_order_relaxed);
+            return;
+        }
+
+        constexpr float stopToleranceDeg = 0.25f;
+        constexpr float proportionalBandDeg = 12.0f;
+        const float maximumInput = clamp(API::VR::get_mod_value<float>("HeadAim_TorsoMaximumInput"), 0.1f, 1.0f);
+        const float yawError = TorsoStats->Torso.IsYawUnbound
+            ? degrees(atan2(sin(radians(desiredYawDeg - TorsoRotation->x)),
+                            cos(radians(desiredYawDeg - TorsoRotation->x))))
+            : desiredYawDeg - TorsoRotation->x;
+        const float pitchError = desiredPitchDeg - TorsoRotation->y;
+        const float yawInput = abs(yawError) <= stopToleranceDeg
+            ? 0.0f : clamp(yawError / proportionalBandDeg, -maximumInput, maximumInput);
+        const float pitchInput = abs(pitchError) <= stopToleranceDeg
+            ? 0.0f : clamp(pitchError / proportionalBandDeg, -maximumInput, maximumInput);
+
+        // Drive the component's ordinary input independently of HeadTarget (torso-weapon aim).
+        *NativeTorsoInput = vec2(yawInput, pitchInput);
+        TorsoYawInput.store(yawInput, std::memory_order_relaxed);
+        TorsoPitchInput.store(pitchInput, std::memory_order_relaxed);
+        ViewYawCompensation.store(desiredViewYawDeg - TorsoRotation->x - rawHeadYawDeg,
+                                  std::memory_order_relaxed);
+        ViewPitchCompensation.store(desiredViewPitchDeg - TorsoRotation->y - rawHeadPitchDeg,
+                                    std::memory_order_relaxed);
+    }
+
+    bool IsHeadAimEnabled() const {
+        return InMech && HeadAimMode && *HeadAimMode != HeadAimMode::Disabled;
     }
 
     void ProcessArmTwist(RotationDegrees cockpitRelativeRot, RotationDegrees torsoAimRotation) {
