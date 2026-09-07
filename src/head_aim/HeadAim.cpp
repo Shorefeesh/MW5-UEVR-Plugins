@@ -52,6 +52,8 @@ class HeadAim final : public PluginExtension {
     std::atomic<float> ViewPitchCompensation{0.0f};
     std::atomic<float> ViewPitchOffset{0.0f};
     std::atomic<float> LocomotionReferenceYaw{0.0f};
+    float UnadjustedViewRoll[2]{0.0f, 0.0f};
+    bool UnadjustedViewRollValid[2]{false, false};
     uint8_t LastLoggedMode = 0xff;
 
     struct TwistBounds {
@@ -77,8 +79,8 @@ public:
         Instance                  = this;
         PluginExtension::Instance = this;
         Name                      = "HeadAim";
-        Version                   = "2.13.2";
-        VersionInt                = 2132;
+        Version                   = "2.15.4";
+        VersionInt                = 2154;
         VersionCheckFnName        = L"OnFetchHeadAimPluginData";
         VersionPropertyName       = L"HeadAimVersion";
     }
@@ -149,24 +151,64 @@ public:
         state->Gamepad.sThumbRY = controllerToThumb(TorsoPitchInput.load(std::memory_order_relaxed));
     }
 
-    virtual void on_pre_calculate_stereo_view_offset(UEVR_StereoRenderingDeviceHandle, int, float,
+    virtual void on_pre_calculate_stereo_view_offset(UEVR_StereoRenderingDeviceHandle, int viewIndex, float,
                                                       UEVR_Vector3f*, UEVR_Rotatorf* rotation, bool isDouble) override {
         if (!rotation || !IsHeadAimEnabled())
             return;
 
-        // Blend toward torso-lag compensation through the expanded yaw range. Both stereo eyes
-        // receive exactly the same render-only rotation; tracking poses remain unmodified.
-        const float yawCompensation = ViewYawCompensation.load(std::memory_order_relaxed);
+        // Retain the v1 camera model: the view includes the full torso tracking error and any
+        // physical head overflow. The curve adds a settled directional cockpit offset, but does
+        // not clamp catch-up or beyond-limit viewing to that offset.
+        const float yawAdjustment = ViewYawCompensation.load(std::memory_order_relaxed);
         const float pitchAdjustment = ViewPitchCompensation.load(std::memory_order_relaxed) +
                                       ViewPitchOffset.load(std::memory_order_relaxed);
+
+        float basePitch;
+        float baseYaw;
+        float baseRoll;
         if (isDouble) {
             auto* rotationDouble = reinterpret_cast<UEVR_Rotatord*>(rotation);
-            rotationDouble->yaw += static_cast<double>(yawCompensation);
+            basePitch = static_cast<float>(rotationDouble->pitch);
+            baseYaw = static_cast<float>(rotationDouble->yaw);
+            baseRoll = static_cast<float>(rotationDouble->roll);
+            rotationDouble->yaw += static_cast<double>(yawAdjustment);
             rotationDouble->pitch += static_cast<double>(pitchAdjustment);
         } else {
-            rotation->yaw += yawCompensation;
+            basePitch = rotation->pitch;
+            baseYaw = rotation->yaw;
+            baseRoll = rotation->roll;
+            rotation->yaw += yawAdjustment;
             rotation->pitch += pitchAdjustment;
         }
+
+        // Predict the roll UEVR would produce from the untouched cockpit camera and current HMD.
+        // The post callback restores only this scalar component after UEVR composes tracking.
+        quat hmdRotation;
+        vec3 hmdPosition;
+        GetHMDPoseAndRotation(hmdRotation, hmdPosition);
+        const quat unadjustedBaseInverse = normalize(quat(yawPitchRoll(
+            radians(-baseYaw), radians(basePitch), radians(-baseRoll))));
+        const quat unadjustedFinalRotation = normalize(unadjustedBaseInverse * hmdRotation);
+        const unsigned eye = static_cast<unsigned>(viewIndex) & 1u;
+        UnadjustedViewRoll[eye] = EulerAnglesFromQuat(unadjustedFinalRotation).z;
+        UnadjustedViewRollValid[eye] = true;
+    }
+
+    virtual void on_post_calculate_stereo_view_offset(UEVR_StereoRenderingDeviceHandle, int viewIndex, float,
+                                                       UEVR_Vector3f*, UEVR_Rotatorf* rotation, bool isDouble) override {
+        if (!rotation || !IsHeadAimEnabled())
+            return;
+
+        const unsigned eye = static_cast<unsigned>(viewIndex) & 1u;
+        if (!UnadjustedViewRollValid[eye])
+            return;
+
+        // Preserve UEVR's original physical/cockpit roll without replacing its completed world
+        // transform. Yaw, pitch, position, and stereo separation remain exactly as composed.
+        if (isDouble)
+            reinterpret_cast<UEVR_Rotatord*>(rotation)->roll = static_cast<double>(UnadjustedViewRoll[eye]);
+        else
+            rotation->roll = UnadjustedViewRoll[eye];
     }
 
     virtual void OnInitialize() override {
@@ -328,15 +370,11 @@ private:
         const float headPitchDeg = -degrees(headPitchRad);
 
         const float viewPitchOffsetDeg = clamp(API::VR::get_mod_value<float>("HeadAim_TorsoPitchOffset"), -30.0f, 30.0f);
-        const float desiredTorsoYawDeg = MapHeadYawToTorso(headYawDeg);
-        const float desiredCockpitYawDeg = MapHeadYawToCockpitView(headYawDeg);
-        const float desiredTorsoPitchDeg = MapHeadPitchToTorso(headPitchDeg);
-        const float desiredCockpitPitchDeg = MapHeadPitchToCockpitView(headPitchDeg);
+        const AxisMapping yawMapping = MapHeadYaw(headYawDeg);
+        const AxisMapping pitchMapping = MapHeadPitch(headPitchDeg);
         LocomotionReferenceYaw.store(headYawDeg, std::memory_order_relaxed);
         ViewPitchOffset.store(viewPitchOffsetDeg, std::memory_order_relaxed);
-        UpdateTorsoController(desiredTorsoYawDeg, desiredTorsoPitchDeg,
-                              desiredCockpitYawDeg, desiredCockpitPitchDeg,
-                              headYawDeg, headPitchDeg);
+        UpdateTorsoController(yawMapping, pitchMapping, headYawDeg, headPitchDeg);
 
         quat aimQuat = normalize(SmoothedHmdQuat * qHeadAimOffset);
         UEVR_Vector3f gazePose{};
@@ -403,88 +441,46 @@ private:
         *HeadTarget = vec2(aimTargetYawDeg, aimTargetPitchDeg);
     }
 
-    float MapHeadYawToTorso(const float headYawDeg) const {
-        constexpr float deadzone = 1.0f;
-        constexpr float innerRange = 15.0f;
-        constexpr float outerRange = 75.0f;
-        const float magnitude = max(0.0f, abs(headYawDeg) - deadzone);
-        if (magnitude == 0.0f)
-            return 0.0f;
+    struct AxisMapping {
+        float TorsoDeg;
+        float CockpitDeg;
+    };
 
-        const float direction = headYawDeg < 0.0f ? -1.0f : 1.0f;
-        const float limit = TorsoStats->Torso.IsYawUnbound
-            ? 180.0f
-            : (direction < 0.0f ? abs(TorsoStats->Torso.BoundsLow.x) : abs(TorsoStats->Torso.BoundsHigh.x));
-        if (limit <= innerRange)
-            return direction * min(magnitude, limit);
-        if (magnitude <= innerRange)
-            return direction * magnitude;
-
-        const float outerAmount = min((magnitude - innerRange) / (outerRange - innerRange), 1.0f);
-        return direction * mix(innerRange, limit, outerAmount);
+    static AxisMapping MapHeadAxis(const float headDeg, const float maximumInputDeg,
+                                   const float maximumCockpitDeg, const float low, const float high) {
+        // The power curve shapes the amplified outer response, but torso movement has a 1:1 floor:
+        // it can never request less rotation than the physical head angle unless the mech has
+        // reached its mechanical limit. The unbounded curve continues to drive cockpit viewing.
+        constexpr float curveExponent = 1.5f;
+        const float neutral = clamp(0.0f, low, high);
+        const float magnitude = abs(headDeg);
+        const float direction = headDeg < 0.0f ? -1.0f : 1.0f;
+        const float curvedAmount = pow(magnitude / maximumInputDeg, curveExponent);
+        const float directionalRange = direction < 0.0f ? neutral - low : high - neutral;
+        const float curvedTorsoMagnitude = directionalRange * curvedAmount;
+        const float torsoMagnitude = min(max(magnitude, curvedTorsoMagnitude), directionalRange);
+        const float torsoDeg = neutral + direction * torsoMagnitude;
+        const float cockpitMagnitude = maximumCockpitDeg * curvedAmount;
+        return {torsoDeg, direction * cockpitMagnitude};
     }
 
-    static float MapHeadYawToCockpitView(const float headYawDeg) {
-        constexpr float innerRange = 15.0f;
-        constexpr float outerRange = 75.0f;
-        constexpr float cockpitLimitAtOuterRange = 20.0f;
-        const float magnitude = abs(headYawDeg);
-        if (magnitude <= innerRange)
-            return headYawDeg;
-
-        const float direction = headYawDeg < 0.0f ? -1.0f : 1.0f;
-        if (magnitude <= outerRange) {
-            const float outerAmount = (magnitude - innerRange) / (outerRange - innerRange);
-            return direction * mix(innerRange, cockpitLimitAtOuterRange, outerAmount);
-        }
-
-        // Preserve unrestricted head movement after reaching the mapped torso range.
-        return direction * (cockpitLimitAtOuterRange + magnitude - outerRange);
+    AxisMapping MapHeadYaw(const float headYawDeg) const {
+        constexpr float maximumInputDeg = 80.0f;
+        constexpr float maximumCockpitDeg = 15.0f;
+        const float low = TorsoStats->Torso.IsYawUnbound ? -180.0f : TorsoStats->Torso.BoundsLow.x;
+        const float high = TorsoStats->Torso.IsYawUnbound ? 180.0f : TorsoStats->Torso.BoundsHigh.x;
+        return MapHeadAxis(headYawDeg, maximumInputDeg, maximumCockpitDeg, low, high);
     }
 
-    float MapHeadPitchToTorso(const float headPitchDeg) const {
-        constexpr float deadzone = 1.0f;
-        constexpr float innerRange = 15.0f;
-        constexpr float outerRange = 30.0f;
+    AxisMapping MapHeadPitch(const float headPitchDeg) const {
+        constexpr float maximumInputDeg = 30.0f;
+        constexpr float maximumCockpitDeg = 15.0f;
         const float low = TorsoStats->Torso.IsPitchUnbound ? -90.0f : TorsoStats->Torso.BoundsLow.y;
         const float high = TorsoStats->Torso.IsPitchUnbound ? 90.0f : TorsoStats->Torso.BoundsHigh.y;
-        // Playspace level is the stable torso-pitch neutral. Do not capture the player's head or
-        // the mech's transient torso pose when entering a cockpit.
-        const float neutral = clamp(0.0f, low, high);
-        const float magnitude = max(0.0f, abs(headPitchDeg) - deadzone);
-        if (magnitude == 0.0f)
-            return neutral;
-
-        const float direction = headPitchDeg < 0.0f ? -1.0f : 1.0f;
-        const float limit = direction < 0.0f ? neutral - low : high - neutral;
-        if (limit <= innerRange)
-            return neutral + direction * min(magnitude, limit);
-        if (magnitude <= innerRange)
-            return neutral + direction * magnitude;
-
-        const float outerAmount = min((magnitude - innerRange) / (outerRange - innerRange), 1.0f);
-        return neutral + direction * mix(innerRange, limit, outerAmount);
+        return MapHeadAxis(headPitchDeg, maximumInputDeg, maximumCockpitDeg, low, high);
     }
 
-    static float MapHeadPitchToCockpitView(const float headPitchDeg) {
-        constexpr float innerRange = 15.0f;
-        constexpr float outerRange = 30.0f;
-        constexpr float cockpitLimitAtOuterRange = 20.0f;
-        const float magnitude = abs(headPitchDeg);
-        if (magnitude <= innerRange)
-            return headPitchDeg;
-
-        const float direction = headPitchDeg < 0.0f ? -1.0f : 1.0f;
-        if (magnitude <= outerRange) {
-            const float outerAmount = (magnitude - innerRange) / (outerRange - innerRange);
-            return direction * mix(innerRange, cockpitLimitAtOuterRange, outerAmount);
-        }
-
-        return direction * (cockpitLimitAtOuterRange + magnitude - outerRange);
-    }
-
-    void UpdateTorsoController(const float desiredYawDeg, const float desiredPitchDeg,
-                               const float desiredCockpitYawDeg, const float desiredCockpitPitchDeg,
+    void UpdateTorsoController(const AxisMapping& yawMapping, const AxisMapping& pitchMapping,
                                const float rawHeadYawDeg, const float rawHeadPitchDeg) {
         if (!IsHeadAimEnabled()) {
             TorsoYawInput.store(0.0f, std::memory_order_relaxed);
@@ -498,10 +494,10 @@ private:
         constexpr float proportionalBandDeg = 12.0f;
         const float maximumInput = clamp(API::VR::get_mod_value<float>("HeadAim_TorsoMaximumInput"), 0.1f, 1.0f);
         const float yawError = TorsoStats->Torso.IsYawUnbound
-            ? degrees(atan2(sin(radians(desiredYawDeg - TorsoRotation->x)),
-                            cos(radians(desiredYawDeg - TorsoRotation->x))))
-            : desiredYawDeg - TorsoRotation->x;
-        const float pitchError = desiredPitchDeg - TorsoRotation->y;
+            ? degrees(atan2(sin(radians(yawMapping.TorsoDeg - TorsoRotation->x)),
+                            cos(radians(yawMapping.TorsoDeg - TorsoRotation->x))))
+            : yawMapping.TorsoDeg - TorsoRotation->x;
+        const float pitchError = pitchMapping.TorsoDeg - TorsoRotation->y;
         const float yawInput = abs(yawError) <= stopToleranceDeg
             ? 0.0f : clamp(yawError / proportionalBandDeg, -maximumInput, maximumInput);
         const float pitchInput = abs(pitchError) <= stopToleranceDeg
@@ -512,20 +508,11 @@ private:
         TorsoYawInput.store(yawInput, std::memory_order_relaxed);
         TorsoPitchInput.store(pitchInput, std::memory_order_relaxed);
 
-        constexpr float lagBlendStart = 15.0f;
-        constexpr float lagBlendEnd = 75.0f;
-        const float lagBlend = clamp((abs(rawHeadYawDeg) - lagBlendStart) /
-                                     (lagBlendEnd - lagBlendStart), 0.0f, 1.0f);
-        const float settledViewCompression = desiredCockpitYawDeg - rawHeadYawDeg;
-        ViewYawCompensation.store(settledViewCompression + lagBlend * yawError,
+        // This is the v1 compensation identity plus the unbounded curve-derived cockpit offset:
+        // settled view = curve output; catching-up view also includes full torso error.
+        ViewYawCompensation.store(yawMapping.CockpitDeg + yawError - rawHeadYawDeg,
                                   std::memory_order_relaxed);
-
-        constexpr float pitchLagBlendStart = 15.0f;
-        constexpr float pitchLagBlendEnd = 30.0f;
-        const float pitchLagBlend = clamp((abs(rawHeadPitchDeg) - pitchLagBlendStart) /
-                                          (pitchLagBlendEnd - pitchLagBlendStart), 0.0f, 1.0f);
-        const float settledPitchCompression = desiredCockpitPitchDeg - rawHeadPitchDeg;
-        ViewPitchCompensation.store(settledPitchCompression + pitchLagBlend * pitchError,
+        ViewPitchCompensation.store(pitchMapping.CockpitDeg + pitchError - rawHeadPitchDeg,
                                     std::memory_order_relaxed);
     }
 
