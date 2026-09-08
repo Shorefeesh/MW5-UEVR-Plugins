@@ -35,6 +35,7 @@ private:
     ComPtr<ID3D11PixelShader>        HUDOverlayPS;
     ComPtr<ID3D11VertexShader>       FullScreenVS;
     ComPtr<ID3D11PixelShader>        PassthroughPS;
+    ComPtr<ID3D11PixelShader>        ZoomCompositePS;
     ComPtr<ID3D11InputLayout>        InputLayout;
     ComPtr<ID3D11Buffer>             VertexBuffer;
     ComPtr<ID3D11SamplerState>       Sampler;

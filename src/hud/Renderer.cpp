@@ -125,7 +125,7 @@ bool Renderer::CompileAndCreatePixelShader(ID3D11Device* dvc, const wchar_t* fil
 }
 
 bool Renderer::EnsurePipeline(ID3D11Device* dvc) {
-    if (TexturedQuadVS && HUDOverlayPS && PassthroughPS && FullScreenVS && InputLayout && VertexBuffer && Sampler && BlendStateHUDCompose && BlendStateHUDOverlay &&
+    if (TexturedQuadVS && HUDOverlayPS && PassthroughPS && ZoomCompositePS && FullScreenVS && InputLayout && VertexBuffer && Sampler && BlendStateHUDCompose && BlendStateHUDOverlay &&
         BlendStateOverwrite && DepthStencilState && RasterizerState)
         return true;
 
@@ -154,7 +154,8 @@ bool Renderer::EnsurePipeline(ID3D11Device* dvc) {
     if (!CompileAndCreateVertexShader(dvc, L"TexturedQuadVS.hlsl", TexturedQuadVS.GetAddressOf(), vsb.GetAddressOf()) ||
         !CompileAndCreatePixelShader(dvc, L"HUDOverlayPS.hlsl", HUDOverlayPS.GetAddressOf(), psb.GetAddressOf()) ||
         !CompileAndCreateVertexShader(dvc, L"FullScreenVS.hlsl", FullScreenVS.GetAddressOf(), vscb.GetAddressOf()) ||
-        !CompileAndCreatePixelShader(dvc, L"PassthroughPS.hlsl", PassthroughPS.GetAddressOf(), pscb.GetAddressOf())
+        !CompileAndCreatePixelShader(dvc, L"PassthroughPS.hlsl", PassthroughPS.GetAddressOf(), pscb.GetAddressOf()) ||
+        !CompileAndCreatePixelShader(dvc, L"ZoomCompositePS.hlsl", ZoomCompositePS.GetAddressOf(), pscb.ReleaseAndGetAddressOf())
     ) {
         Log::LogError("Compiling shaders failed");
         return false;
@@ -376,12 +377,14 @@ void Renderer::RenderHUD(HUDWidgetRenderData                         widgets[4],
 
         if (zoomLevel > 1.02f) {
             const auto torsoCrosshair = widgets[(int32_t)WidgetType::TorsoCrosshair];
+            const auto armsTargetCrosshair = widgets[(int32_t)WidgetType::ArmsTargetCrosshair];
+
+            if (torsoCrosshair.RenderTargetSizeX <= 0 || torsoCrosshair.RenderTargetSizeY <= 0 ||
+                armsTargetCrosshair.RenderTargetSizeX <= 0 || armsTargetCrosshair.RenderTargetSizeY <= 0)
+                return;
 
             if (eye == 0) {
                 // Validate/create and switch to the 2D camera overlay RT and clear it
-                if (torsoCrosshair.RenderTargetSizeX == 0 || torsoCrosshair.RenderTargetSizeY == 0)
-                    return;
-
                 if (!ZoomCameraMarkerRTV || !ZoomCameraMarkerSRV) {
                     CreateZoomCameraMarkerRT(dvc.Get(), torsoCrosshair.RenderTargetSizeX, torsoCrosshair.RenderTargetSizeY, ZoomCameraMarkerTexture, ZoomCameraMarkerRTV,
                                              ZoomCameraMarkerSRV);
@@ -410,16 +413,35 @@ void Renderer::RenderHUD(HUDWidgetRenderData                         widgets[4],
             if (!ZoomCameraMarkerRTV || !ZoomCameraMarkerSRV)
                 return;
 
-            // Use the MVP for rendering the TorsoCrosshair widget - it will be the exact same dimensions and location
+            // Use the arms-target orientation and position so the marker texture is
+            // mapped onto the zoom display after that display moves with eye aim.
+            // Preserve the torso quad's projected dimensions because it is the
+            // geometry for which this overlay was authored.
             ctx->RSSetViewports(1, &viewPort);
             ctx->OMSetRenderTargets(1, HUDTarget.RTV.GetAddressOf(), nullptr);
-            ctx->PSSetShader(PassthroughPS.Get(), nullptr, 0);
+            ctx->PSSetShader(ZoomCompositePS.Get(), nullptr, 0);
             auto zoomSrv = ZoomCameraMarkerSRV.Get();
             ctx->PSSetShaderResources(0, 1, &zoomSrv);
 
             if (D3D11_MAPPED_SUBRESOURCE m; SUCCEEDED(ctx->Map(QuadConstantsCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
                 auto* vs = (QuadConstants*)m.pData;
-                vs->MVP  = torsoCrosshair.MVPs[frameIndex][eye];
+                auto overlayMVP = armsTargetCrosshair.MVPs[frameIndex][eye];
+
+                // Scale the target widget into the authored torso-overlay dimensions
+                // using model-space constants. Comparing already-projected torso and
+                // target axes made the outline change shape as it moved off-centre.
+                constexpr float componentScaleRatio = 90.0f / 67.5f;
+                const float widthScale = componentScaleRatio *
+                    static_cast<float>(torsoCrosshair.RenderTargetSizeX) /
+                    static_cast<float>(armsTargetCrosshair.RenderTargetSizeX);
+                const float heightScale = componentScaleRatio *
+                    static_cast<float>(torsoCrosshair.RenderTargetSizeY) /
+                    static_cast<float>(armsTargetCrosshair.RenderTargetSizeY);
+                overlayMVP[0] *= widthScale;
+                overlayMVP[1] *= heightScale;
+                overlayMVP[2] *= componentScaleRatio;
+
+                vs->MVP = overlayMVP;
                 ctx->Unmap(QuadConstantsCB.Get(), 0);
             }
 
@@ -432,6 +454,10 @@ void Renderer::RenderHUD(HUDWidgetRenderData                         widgets[4],
             ctx->OMSetRenderTargets(1, HUDTarget.RTV.GetAddressOf(), nullptr);
             RenderMarkersToCurrentRT(ctx.Get(), &markers, eye);
         }
+
+        // ZoomCompositePS adds the border. Restore the ordinary texture shader
+        // before drawing the remaining HUD widgets.
+        ctx->PSSetShader(PassthroughPS.Get(), nullptr, 0);
 
         for (int i = 0; i < 4; ++i) {
             auto& widget = widgets[i];

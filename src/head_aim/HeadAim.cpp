@@ -15,6 +15,7 @@ class HeadAim final : public PluginExtension {
     bool*         ArmlockEnabled         = nullptr;
     bool*         EnableArmLock          = nullptr;
     float*        ZoomLevel              = nullptr;
+    float*        ZoomCameraFOV          = nullptr;
     float*        HeadAimPitchOffset     = nullptr;
     vec2*         TorsoRotation          = nullptr;
     vec3*         MechRelativeRotation   = nullptr;
@@ -35,7 +36,7 @@ class HeadAim final : public PluginExtension {
     vec2  PreviousTorsoRotation = vec2(0, 0);
 
 #define ARM_SPRING_CONSTANT 200.0f
-#define ARM_DAMPING_CONSTANT 25.0f
+#define ARM_DAMPING_CONSTANT 32.0f
 
     vec2 CurrentArmVelocity{};
     vec2 CurrentArmRotation{};
@@ -43,6 +44,10 @@ class HeadAim final : public PluginExtension {
     bool SmoothedQuatInit = false;
     quat SmoothedGazeQuat  = quat(1, 0, 0, 0);
     bool SmoothedGazeQuatInit = false;
+    quat ZoomCenterQuat = quat(1, 0, 0, 0);
+    bool ZoomCenterInit = false;
+    bool ZoomEdgePanning = false;
+    vec2 EffectiveArmsTarget{};
 
     struct TwistBounds {
         // Yaw, Pitch
@@ -67,14 +72,18 @@ public:
         Instance                  = this;
         PluginExtension::Instance = this;
         Name                      = "HeadAim";
-        Version                   = "2.5.1";
-        VersionInt                = 251;
+        Version                   = "2.6.12";
+        VersionInt                = 2612;
         VersionCheckFnName        = L"OnFetchHeadAimPluginData";
         VersionPropertyName       = L"HeadAimVersion";
     }
 
     virtual void on_pre_engine_tick(API::UGameEngine* engine, const float delta) override {
         if (const auto activePawn = API::get()->get_local_pawn(0); activePawn != Pawn) {
+            SmoothedQuatInit = false;
+            SmoothedGazeQuatInit = false;
+            ZoomCenterInit = false;
+            ZoomEdgePanning = false;
             InMech = OnNewPawn(activePawn);
         }
 
@@ -115,7 +124,7 @@ public:
         if (*Instance->HeadAimMode == HeadAimMode::Disabled)
             return nullptr;
         const auto rotations = *frame->GetParams<OnCalculateHeadAimParams>();
-        Instance->ProcessHeadAim();
+        Instance->ProcessHeadAim(rotations.Torso);
         Instance->ProcessArmTwist(rotations.Cockpit, rotations.Torso);
         return nullptr;
     }
@@ -147,7 +156,7 @@ private:
         if (!activePawn)
             return false;
 
-        API::UObject* mechViewC,* mechMeshC,* cockpitC,* torsoTwistC,* mechCockpit,* userSettings,* vrHUDManager,* mechRootC,* targetTrackingC;
+        API::UObject* mechViewC,* mechMeshC,* cockpitC,* torsoTwistC,* mechCockpit,* userSettings,* vrHUDManager,* mechRootC,* targetTrackingC,* zoomCamera;
 
         const auto playerController = API::get()->get_player_controller(0);
 
@@ -170,6 +179,8 @@ private:
                   TryGetPropertyStruct(userSettings, L"EnableArmLock", EnableArmLock) &&
                   TryGetProperty(mechCockpit, L"VR_HUDManager", vrHUDManager) &&
                   TryGetPropertyStruct(vrHUDManager, L"ZoomLevel", ZoomLevel) &&
+                  TryGetProperty(mechCockpit, L"VR_NormalCamera", zoomCamera) &&
+                  TryGetPropertyStruct(zoomCamera, L"FOVAngle", ZoomCameraFOV) &&
                   TryGetPropertyStruct(torsoTwistC, L"TorsoTwist", TorsoRotation) &&
                   TryGetProperty(Pawn, L"RootComponent", mechRootC) &&
                   TryGetPropertyStruct(mechRootC, L"RelativeRotation", MechRelativeRotation) &&
@@ -205,7 +216,7 @@ private:
         return true;
     }
 
-    void ProcessHeadAim() {
+    void ProcessHeadAim(const RotationDegrees torsoAimRotation) {
         constexpr auto  fwd         = vec3(1, 0, 0);
         constexpr float deadbandRad = radians(0.15f); // 0.10–0.25
         constexpr float maxAngleRad = radians(3.0f);  // 3–5
@@ -232,12 +243,9 @@ private:
 
         const vec3 headDir = normalize(SmoothedHmdQuat * fwd);
 
-        const float headYawRad   = atan2(headDir.y, headDir.x);
-        const float headPitchRad = atan2(headDir.z, sqrt(headDir.x * headDir.x + headDir.y * headDir.y));
-        const float headYawDeg   = -degrees(headYawRad);
-        const float headPitchDeg = -degrees(headPitchRad);
-
-        quat aimQuat = SmoothedHmdQuat;
+        vec3 cameraAimDirection = headDir;
+        vec3 weaponAimDirection = headDir;
+        vec3 headAimDirection = headDir;
         UEVR_Vector3f gazePose{};
         UEVR_Quaternionf gazeRotation{};
         const auto apiVersion = API::get()->param()->version;
@@ -261,45 +269,133 @@ private:
                 SmoothedGazeQuatInit = true;
             }
 
-            const float gazeAngle = QuatAngleRad(SmoothedGazeQuat, gazeTarget);
-            const float gazeEffectiveAngle = max(0.0f, gazeAngle - deadbandRad);
-            const float gazeAdaptive = clamp(gazeEffectiveAngle / maxAngleRad, 0.0f, 1.0f);
-            const float gazeLambda = mix(lambdaSlow, lambdaFast, gazeAdaptive);
-            const float gazeT = 1.0f - expf(-gazeLambda * Delta);
-            SmoothedGazeQuat = normalize(slerp(SmoothedGazeQuat, gazeTarget, gazeT));
-            aimQuat = SmoothedGazeQuat;
+            const bool zoomActive = ZoomLevel && ZoomCameraFOV && *ZoomLevel > 1.02f;
+            if (zoomActive) {
+                if (!ZoomCenterInit) {
+                    ZoomCenterQuat = SmoothedGazeQuat;
+                    ZoomCenterInit = true;
+                    ZoomEdgePanning = false;
+                }
+
+                const vec3 rawGazeDirection = normalize(gazeTarget * fwd);
+                const float captureHalfFOV = radians(clamp(*ZoomCameraFOV, 1.0f, 170.0f) * 0.5f);
+                const float displayHalfFOV = radians(clamp(*ZoomCameraFOV * *ZoomLevel, 1.0f, 170.0f) * 0.5f);
+                constexpr float zoomAspect = 640.0f / 430.0f;
+                const float captureTanX = std::tan(captureHalfFOV);
+                const float captureTanY = captureTanX / zoomAspect;
+                const float displayTanX = std::tan(displayHalfFOV);
+                const float displayTanY = displayTanX / zoomAspect;
+
+                auto gazeUV = [&]() {
+                    const vec3 localGaze = inverse(ZoomCenterQuat) * rawGazeDirection;
+                    const float forward = max(0.001f, localGaze.x);
+                    return vec2(localGaze.y / (forward * displayTanX),
+                                localGaze.z / (forward * displayTanY));
+                };
+
+                // The torso center is a gaze snap target, independent of the zoom
+                // window's current position. Snap only while gaze is within 1.5
+                // degrees of it. As soon as gaze leaves that cone, resume the same
+                // edge-panning controller used everywhere else.
+                constexpr float centerLookSnapAngle = radians(1.5f);
+                bool lookingAtTorsoCenter = false;
+                {
+                    // TorsoAim is the small reticle offset from the cockpit after the
+                    // component hierarchy has already applied TorsoRotation. Negating
+                    // its yaw and pitch produces the ArmsTarget-space torso direction
+                    // without applying the physical torso twist a second time.
+                    const float torsoTargetYaw = -torsoAimRotation.Yaw;
+                    const float torsoTargetPitch = -torsoAimRotation.Pitch;
+                    const quat torsoAimQuat = MakeYawPitchRollQuat(
+                        -radians(torsoTargetYaw), radians(torsoTargetPitch), 0.0f);
+                    const vec3 torsoAimDirection = normalize(torsoAimQuat * fwd);
+                    const float gazeToTorsoAngle = acos(clamp(dot(rawGazeDirection, torsoAimDirection), -1.0f, 1.0f));
+                    lookingAtTorsoCenter = gazeToTorsoAngle <= centerLookSnapAngle;
+                    if (lookingAtTorsoCenter) {
+                        const vec3 zoomCenterDirection = normalize(ZoomCenterQuat * fwd);
+                        const float d = clamp(dot(zoomCenterDirection, torsoAimDirection), -1.0f, 1.0f);
+                        const vec3 axis = cross(zoomCenterDirection, torsoAimDirection);
+                        if (d > -0.9999f) {
+                            const quat toTorso = normalize(quat(1.0f + d, axis.x, axis.y, axis.z));
+                            ZoomCenterQuat = normalize(toTorso * ZoomCenterQuat);
+                        }
+                        ZoomEdgePanning = false;
+                    }
+                }
+
+                vec2 uv = gazeUV();
+                const float edge = max(std::abs(uv.x), std::abs(uv.y));
+                if (!lookingAtTorsoCenter) {
+                    if (!ZoomEdgePanning && edge >= 0.85f)
+                        ZoomEdgePanning = true;
+                    else if (ZoomEdgePanning && edge <= 0.65f)
+                        ZoomEdgePanning = false;
+                }
+
+                if (ZoomEdgePanning) {
+                    constexpr float panLambda = 8.0f;
+                    const float panT = 1.0f - expf(-panLambda * Delta);
+                    ZoomCenterQuat = normalize(slerp(ZoomCenterQuat, gazeTarget, panT));
+                    uv = gazeUV();
+                }
+
+                // The gaze ray intersects the magnified display at uv. Unproject
+                // that same point through the capture camera to recover its world ray.
+                uv = clamp(uv, vec2(-1.25f), vec2(1.25f));
+                const vec3 captureLocalDirection = normalize(vec3(1.0f,
+                                                                  uv.x * captureTanX,
+                                                                  uv.y * captureTanY));
+                cameraAimDirection = normalize(ZoomCenterQuat * fwd);
+                weaponAimDirection = normalize(ZoomCenterQuat * captureLocalDirection);
+                headAimDirection = weaponAimDirection;
+                SmoothedGazeQuat = ZoomCenterQuat;
+            } else {
+                ZoomCenterInit = false;
+                ZoomEdgePanning = false;
+
+                const float gazeAngle = QuatAngleRad(SmoothedGazeQuat, gazeTarget);
+                const float gazeEffectiveAngle = max(0.0f, gazeAngle - deadbandRad);
+                const float gazeAdaptive = clamp(gazeEffectiveAngle / maxAngleRad, 0.0f, 1.0f);
+                const float gazeLambda = mix(lambdaSlow, lambdaFast, gazeAdaptive);
+                const float gazeT = 1.0f - expf(-gazeLambda * Delta);
+                SmoothedGazeQuat = normalize(slerp(SmoothedGazeQuat, gazeTarget, gazeT));
+                cameraAimDirection = normalize(SmoothedGazeQuat * fwd);
+                weaponAimDirection = cameraAimDirection;
+                headAimDirection = cameraAimDirection;
+            }
         } else {
             SmoothedGazeQuatInit = false;
+            ZoomCenterInit = false;
+            ZoomEdgePanning = false;
         }
 
-        const vec3 dir = normalize(aimQuat * fwd);
+        auto directionToTarget = [&](const vec3& direction) {
+            const float yaw = -degrees(atan2(direction.y, direction.x));
+            const float pitch = -degrees(atan2(direction.z, sqrt(direction.x * direction.x + direction.y * direction.y)));
+            vec2 target = *HeadAimLocked ? vec2(0.0f) : vec2(yaw, pitch);
+            if (!TorsoStats->Arm.IsYawUnbound)
+                target.x = clamp(target.x, TorsoStats->Arm.BoundsLow.x, TorsoStats->Arm.BoundsHigh.x);
+            if (!TorsoStats->Arm.IsPitchUnbound)
+                target.y = clamp(target.y, TorsoStats->Arm.BoundsLow.y, TorsoStats->Arm.BoundsHigh.y);
+            return target;
+        };
 
-        const float yawRad   = atan2(dir.y, dir.x);
-        const float pitchRad = atan2(dir.z, sqrt(dir.x * dir.x + dir.y * dir.y));
-
-        const float yawDeg   = -degrees(yawRad);
-        const float pitchDeg = -degrees(pitchRad);
-
-        float armsTargetYawDeg   = *HeadAimLocked ? 0 : yawDeg;
-        float armsTargetPitchDeg = *HeadAimLocked ? 0 : pitchDeg;
-
-        if (!TorsoStats->Arm.IsYawUnbound)
-            armsTargetYawDeg = clamp(armsTargetYawDeg, TorsoStats->Arm.BoundsLow.x, TorsoStats->Arm.BoundsHigh.x);
-        if (!TorsoStats->Arm.IsPitchUnbound)
-            armsTargetPitchDeg = clamp(armsTargetPitchDeg, TorsoStats->Arm.BoundsLow.y, TorsoStats->Arm.BoundsHigh.y);
-
-        *ArmsTarget = vec2(armsTargetYawDeg, armsTargetPitchDeg);
-        *HeadTarget = vec2(headYawDeg, headPitchDeg);
+        *ArmsTarget = directionToTarget(cameraAimDirection);
+        EffectiveArmsTarget = directionToTarget(weaponAimDirection);
+        const float headYaw = -degrees(atan2(headAimDirection.y, headAimDirection.x));
+        const float headPitch = -degrees(atan2(headAimDirection.z,
+                                               sqrt(headAimDirection.x * headAimDirection.x +
+                                                    headAimDirection.y * headAimDirection.y)));
+        *HeadTarget = *HeadAimLocked ? vec2(0.0f) : vec2(headYaw, headPitch);
     }
 
     void ProcessArmTwist(RotationDegrees cockpitRelativeRot, RotationDegrees torsoAimRotation) {
-        const float zoom        = max(0.001f, *ZoomLevel);
-        const float invZoom     = 1.0f / zoom;
-        const float oneMinusInv = 1.0f - invZoom;
-
         // Calculate the target in cockpit relative coordinates so that it's stable relative to the cockpit regardless of torso twist or pitch,
         // otherwise the target will have to chase the torso as it rotates
-        vec2 targetArmRotation = *ArmsTarget * invZoom;
+        // The zoom camera now follows ArmsTarget, so gameplay aim must use the full
+        // eye-directed angle. Dividing by zoom was compensation for the old fixed,
+        // torso-centred zoom window and caused weapons to fire at 1/zoom.
+        vec2 targetArmRotation = EffectiveArmsTarget;
 
         static bool springInit = false;
         if (!springInit) {
@@ -339,9 +435,10 @@ private:
             yawOffset   = torsoAimRotation.Yaw;
             pitchOffset = -torsoAimRotation.Pitch;
         } else {
-            // Apply torsoDelta to catch the current frame's torso rotation and add the difference between the cockpit and torso aim accounting for zoom level
-            yawOffset   = -torsoDelta.x * invZoom + torsoAimRotation.Yaw * oneMinusInv;
-            pitchOffset = torsoDelta.y * invZoom - torsoAimRotation.Pitch * oneMinusInv;
+            // Apply the current frame's torso motion without fixed-window zoom
+            // compensation. The moving camera and target share the same direction.
+            yawOffset   = -torsoDelta.x;
+            pitchOffset = torsoDelta.y;
         }
 
         // CockpitRelativeRot is the rotation of the cockpit relative to the mech

@@ -25,12 +25,41 @@ private:
     float                               ZoomLevel[3]{};
     bool                                InMech[3]{};
     bool                                CurrentlyInMech      = false;
+    API::UObject*                       ZoomCameraRotator     = nullptr;
+    API::UObject*                       ArmsCrosshairRotator  = nullptr;
+    API::UObject*                       ArmsTargetRotator     = nullptr;
+    API::UObject*                       ZoomCameraDisplay     = nullptr;
+    API::UObject*                       TorsoCrosshairComponent = nullptr;
+    API::UObject*                       ArmsTargetCrosshairComponent = nullptr;
+    API::UObject*                       ZoomOutline           = nullptr;
+    API::UObject*                       ZoomOutlineClipParent = nullptr;
+    vec3*                               CurrentArmAimDirection = nullptr;
+    BP_FUNC                             HUDManagerReceiveTickOriginal = nullptr;
+    bool                                HUDManagerTickHookInstalled   = false;
+    bool                                ZoomDisplayAttached           = false;
+    bool                                ZoomOutlineMoved              = false;
+    bool                                ZoomAlignmentLogged           = false;
 
     void Reset();
 
     virtual void OnInitialize() override;
 
     bool OnNewPawn(API::UObject* activePawn);
+
+    void ImproveZoomCaptureResolution(API::UObject* mechCockpit);
+    void ImproveZoomCaptureResolution(API::UObject* sceneCapture, const char* eyeName);
+
+    bool AlignZoomCameraToArmsTarget();
+    bool AlignWeaponCrosshairToZoomCamera();
+    bool AttachZoomDisplayToArmsTarget();
+    static bool SetWorldRotation(API::UObject* component, const vec3& rotation);
+    static bool SetWorldLocation(API::UObject* component, const vec3& location);
+    bool MoveZoomOutlineToArmsTarget();
+    bool SetZoomOutlineTranslation(const FVector2D& translation);
+    bool SetZoomOutlineOpacity(float opacity);
+    bool DisableZoomOutlineClipping();
+
+    static void* HUDManager_ReceiveTick(API::UObject* self, FFrame* frame, void* result);
 
     bool TryGetWidget3DRenderData(const char* name, WidgetType type, API::UObject* component, bool logFailures = true);
 
